@@ -7,6 +7,13 @@ on:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, target: x86_64-unknown-linux-musl }
+          - { platform: linux/arm64, target: aarch64-unknown-linux-musl }
+          - { platform: linux/arm/v7, target: armv7-unknown-linux-musleabihf }
     steps:
       -
         name: Checkout
@@ -30,3 +37,4 @@ jobs:
           context: .
           push: true
           tags: ${{ vars.DOCKERHUB_USERNAME }}/redlib:latest
+          build-args: TARGET=${{ matrix.target }}
