@@ -2,11 +2,7 @@ name: Release Build
 
 on:
   push:
-    paths-ignore:
-      - "*.md"
-      - "compose.*"
-    branches:
-      - "main"
+    branches: [ "weyandt" ]
   release:
     types: [published]
 
