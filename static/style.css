@@ -1401,6 +1401,12 @@ a.search_subreddit:hover {
     margin: 0;
 }
 
+.comment figure img,
+.comment figure video {
+    max-width: 100%;
+    max-height: 320px;
+}
+
 .comment_left,
 .comment_right {
     display: flex;

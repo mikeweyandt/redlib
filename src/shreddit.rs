@@ -7,7 +7,7 @@
 // templates work unchanged.
 
 use crate::client::{json, CLIENT};
-use crate::utils::param;
+use crate::utils::{format_url, param};
 use chrono::DateTime;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use scraper::{ElementRef, Html, Node, Selector};
@@ -246,11 +246,14 @@ const ALLOWED_TAGS: &[&str] = &[
 	"td",
 	"span",
 	"img",
+	"figure",
 ];
 const VOID_TAGS: &[&str] = &["br", "hr", "img"];
 
 /// Rebuilds comment body HTML with only markdown tags and the attributes
 /// links, images and tables need, dropping Reddit's wrappers and styling.
+/// Media URLs are rewritten to Redlib's proxy here, as rewrite_urls only
+/// handles Reddit media in the link format of the JSON API.
 fn clean_html(el: ElementRef) -> String {
 	let mut out = String::new();
 	for child in el.children() {
@@ -262,25 +265,53 @@ fn clean_html(el: ElementRef) -> String {
 					continue;
 				}
 				let inner = ElementRef::wrap(child).map(clean_html).unwrap_or_default();
-				if !ALLOWED_TAGS.contains(&tag) {
-					out += &inner;
-					continue;
-				}
-				out += &format!("<{tag}");
-				for name in ["href", "src", "alt", "title", "align"] {
-					if let Some(value) = e.attr(name).filter(|v| !v.trim_start().to_lowercase().starts_with("javascript:")) {
-						out += &format!(" {name}=\"{}\"", htmlescape::encode_minimal(value));
+				match tag {
+					"shreddit-spoiler" => out += &format!("<span class=\"md-spoiler-text\">{inner}</span>"),
+					// GIFs and videos in comments
+					"shreddit-player" => {
+						let src = url_attr(e.attr("src"));
+						if !src.is_empty() {
+							let play = if e.attr("gif").is_some() { "autoplay loop muted playsinline" } else { "controls" };
+							out += &format!("<video src=\"{src}\" {play}></video>");
+						}
 					}
-				}
-				out += ">";
-				if !VOID_TAGS.contains(&tag) {
-					out += &format!("{inner}</{tag}>");
+					_ if !ALLOWED_TAGS.contains(&tag) => out += &inner,
+					_ => {
+						out += &format!("<{tag}");
+						for name in ["href", "src", "alt", "title", "align"] {
+							let Some(value) = e.attr(name) else { continue };
+							let value = if matches!(name, "href" | "src") {
+								url_attr(Some(value))
+							} else {
+								htmlescape::encode_minimal(value)
+							};
+							if !value.is_empty() {
+								out += &format!(" {name}=\"{value}\"");
+							}
+						}
+						if tag == "img" {
+							out += " loading=\"lazy\"";
+						}
+						out += ">";
+						if !VOID_TAGS.contains(&tag) {
+							out += &format!("{inner}</{tag}>");
+						}
+					}
 				}
 			}
 			_ => {}
 		}
 	}
 	out
+}
+
+/// Escaped URL attribute value, proxied through Redlib for Reddit media. Empty for `javascript:` URLs.
+fn url_attr(value: Option<&str>) -> String {
+	let value = value.unwrap_or_default().trim();
+	if value.to_lowercase().starts_with("javascript:") {
+		return String::new();
+	}
+	htmlescape::encode_minimal(&format_url(value))
 }
 
 #[cfg(test)]
@@ -317,20 +348,20 @@ mod tests {
 <shreddit-comment thingId="t1_c" author="[deleted]" created="" score="1" depth="0" is-comment-deleted>
   <div id="comment-children"><shreddit-comment thingId="t1_d" author="dan" created="" score="3" depth="1" parentId="t1_c"><div id="t1_d-comment-rtjson-content" slot="comment"><p>orphan body</p></div></shreddit-comment></div>
 </shreddit-comment>
+<shreddit-comment thingId="t1_e" author="eve" created="" score="1" depth="0">
+  <div id="t1_e-comment-rtjson-content" slot="comment"><p><shreddit-spoiler>secret</shreddit-spoiler></p><figure class="rte-media"><a href="https://preview.redd.it/x-v0-abc.jpeg?width=400&amp;s=1" class="w-fit"><img src="https://preview.redd.it/x-v0-abc.jpeg?width=400&amp;s=1" alt="Comment Image" srcset="a 1x" style="x"></a></figure><figure class="rte-media"><shreddit-player src="https://external-preview.redd.it/g.gif?width=356&amp;format=mp4&amp;s=2" gif autoplay><source src="https://external-preview.redd.it/g.gif"></shreddit-player></figure></div>
+</shreddit-comment>
 <faceplate-partial src="/svc/shreddit/more-comments/linux/t3_p?top-level=1&amp;comments-remaining=90&amp;commentPositionOffset=10" method="post"><input type="hidden" name="cursor" value="ab+/="></faceplate-partial>
 "#;
 		let comments = parse_comments(html, "p");
-		assert_eq!(comments.len(), 3);
+		assert_eq!(comments.len(), 4);
 
 		let a = &comments[0]["data"];
 		assert_eq!(a["author"], "alice");
 		assert_eq!(a["parent_id"], "t3_p");
 		assert_eq!(a["score"], 18);
 		assert_eq!(a["created_utc"], 1792515653);
-		assert_eq!(
-			a["body_html"],
-			r#"<div class="md"><p>Hi <a href="https://www.reddit.com/r/rust">r/rust</a> &amp; </p></div>"#
-		);
+		assert_eq!(a["body_html"], r#"<div class="md"><p>Hi <a href="/r/rust">r/rust</a> &amp; </p></div>"#);
 
 		let replies = a["replies"]["data"]["children"].as_array().unwrap();
 		assert_eq!(replies.len(), 2);
@@ -345,8 +376,17 @@ mod tests {
 		assert_eq!(c["body_html"], r#"<div class="md"><p>[deleted]</p></div>"#);
 		assert_eq!(c["replies"]["data"]["children"][0]["data"]["author"], "dan");
 
-		assert_eq!(comments[2]["kind"], "more_comments");
-		assert_eq!(comments[2]["data"]["count"], 90);
-		assert_eq!(comments[2]["data"]["id"], "ab%2B%2F%3D");
+		assert_eq!(
+			comments[2]["data"]["body_html"],
+			concat!(
+				r#"<div class="md"><p><span class="md-spoiler-text">secret</span></p>"#,
+				r#"<figure><a href="/preview/pre/x-v0-abc.jpeg?width=400&amp;s=1"><img src="/preview/pre/x-v0-abc.jpeg?width=400&amp;s=1" alt="Comment Image" loading="lazy"></a></figure>"#,
+				r#"<figure><video src="/preview/external-pre/g.gif?width=356&amp;format=mp4&amp;s=2" autoplay loop muted playsinline></video></figure></div>"#
+			)
+		);
+
+		assert_eq!(comments[3]["kind"], "more_comments");
+		assert_eq!(comments[3]["data"]["count"], 90);
+		assert_eq!(comments[3]["data"]["id"], "ab%2B%2F%3D");
 	}
 }
