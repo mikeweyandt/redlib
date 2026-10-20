@@ -12,7 +12,7 @@ use percent_encoding::{percent_encode, CONTROLS};
 use serde_json::Value;
 use std::result::Result;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 use std::sync::LazyLock;
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Response as WreqResponse};
@@ -38,6 +38,10 @@ pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 pub static OAUTH_RATELIMIT_REMAINING: AtomicU16 = AtomicU16::new(99);
 
 pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
+
+/// Unix time until which the `/comments/` JSON API is assumed blocked, see `shreddit.rs`.
+static COMMENTS_API_BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
+const COMMENTS_API_RETRY_SECS: u64 = 3600;
 
 const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
@@ -327,6 +331,13 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
+	// While the comments API is blocked, skip straight to scraping instead of wasting a request
+	let is_comments = path.contains("/comments/");
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+	if is_comments && now < COMMENTS_API_BLOCKED_UNTIL.load(Ordering::Relaxed) {
+		return Box::pin(crate::shreddit::thread(&path, quarantine)).await;
+	}
+
 	// First, handle rolling over the OAUTH_CLIENT if need be.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
@@ -340,6 +351,14 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
+
+			// Reddit's network security block is an HTML page; private/quarantined subs are JSON 403s
+			let is_html = response.headers().get(wreq_header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+			if is_comments && status == 403 && is_html {
+				warn!("Comments API blocked, scraping comments for the next {COMMENTS_API_RETRY_SECS}s");
+				COMMENTS_API_BLOCKED_UNTIL.store(now + COMMENTS_API_RETRY_SECS, Ordering::Relaxed);
+				return Box::pin(crate::shreddit::thread(&path, quarantine)).await;
+			}
 
 			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
 				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
