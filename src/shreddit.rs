@@ -1,5 +1,6 @@
-// Fallback for post pages while Reddit blocks the `/comments/` JSON API
-// (403 "blocked by network security" since 2026-10-20).
+// Fallback for post pages when Reddit blocks the `/comments/` JSON API
+// (403 "blocked by network security" since 2026-10-20; `client::request`
+// currently gets past it by encoding a slash).
 //
 // The post itself still comes from the JSON API (`/by_id`). Comments are scraped
 // from the HTML fragments reddit.com loads them from (`/svc/shreddit/...`) and

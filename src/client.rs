@@ -1,7 +1,7 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
-use crate::utils::{format_url, Post};
+use crate::utils::{format_url, param, Post};
 use arc_swap::ArcSwap;
 use cached::proc_macro::cached;
 use futures_lite::future::block_on;
@@ -234,8 +234,13 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
 fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	// Build Reddit URL from path.
-	let url = format!("{base_path}{path}");
+	// Reddit blocks `/comments/` API paths by their literal text, but decodes an
+	// encoded slash before routing. Rewritten here so redirects get it too.
+	let url = if base_path == REDDIT_URL_BASE {
+		format!("{base_path}{}", path.replacen("/comments/", "/comments%2F", 1))
+	} else {
+		format!("{base_path}{path}")
+	};
 
 	let mut headers: Vec<(String, String)> = vec![
 		("Host".into(), host.into()),
@@ -331,10 +336,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
-	// While the comments API is blocked, skip straight to scraping instead of wasting a request
+	// While the comments API is blocked, skip straight to scraping instead of wasting a request.
+	// Cursors come from scraped pages' "More comments" links, which only the scraper understands.
 	let is_comments = path.contains("/comments/");
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-	if is_comments && now < COMMENTS_API_BLOCKED_UNTIL.load(Ordering::Relaxed) {
+	if is_comments && (param(&path, "cursor").is_some() || now < COMMENTS_API_BLOCKED_UNTIL.load(Ordering::Relaxed)) {
 		return Box::pin(crate::shreddit::thread(&path, quarantine)).await;
 	}
 
