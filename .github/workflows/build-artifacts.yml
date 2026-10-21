@@ -7,11 +7,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-  CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-  CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: arm-linux-gnueabihf-gcc
-  CC_armv7_unknown_linux_musleabihf: arm-linux-gnueabihf-gcc
-
 jobs:
   build:
     name: Rust project - latest
@@ -29,27 +24,28 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
+      - run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools git cmake perl pkg-config libclang-dev
+          sudo apt-get install -y --no-install-recommends git cmake perl pkg-config libclang-dev
 
-      - if: matrix.target == 'armv7-unknown-linux-musleabihf'
-        run: |
-          sudo apt update
-          sudo apt install -y gcc-arm-linux-gnueabihf musl-tools git cmake perl pkg-config libclang-dev
+      # boring-sys2 builds BoringSSL (C++), so each musl target needs a C/C++ cross toolchain; zig provides one
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
 
-      - if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt update
-          sudo apt install -y gcc-aarch64-linux-gnu musl-tools git cmake perl pkg-config libclang-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.4
 
       - name: Versions
         id: version
         run: echo "VERSION=$(cargo metadata --format-version 1 --no-deps | jq .packages[0].version -r | sed 's/^/v/')" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+        env:
+          # musl 1.2 uses a 64-bit time_t on 32-bit targets; without this the libc crate assumes 32-bit and boring2 fails to compile
+          RUST_LIBC_UNSTABLE_MUSL_V1_2_3: ${{ matrix.target == 'armv7-unknown-linux-musleabihf' && '1' || '0' }}
 
       - name: Package release
         run: tar czf redlib-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release/ redlib
