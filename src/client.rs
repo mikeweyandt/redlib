@@ -1,5 +1,5 @@
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
+use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl, REDDIT_SESSION};
 use crate::server::RequestExt;
 use crate::utils::{format_url, param, Post};
 use arc_swap::ArcSwap;
@@ -42,6 +42,8 @@ pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 /// Unix time until which the `/comments/` JSON API is assumed blocked, see `shreddit.rs`.
 static COMMENTS_API_BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 const COMMENTS_API_RETRY_SECS: u64 = 3600;
+
+const QUARANTINE_COOKIE: &str = "_options=%7B%22pref_quarantine_optin%22%3A%20true%2C%20%22pref_gated_sr_optin%22%3A%20true%7D";
 
 const URL_PAIRS: [(&str, &str); 2] = [
 	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
@@ -181,7 +183,9 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	// Add User-Agent header of the currently spoofed device
 	{
 		let client = OAUTH_CLIENT.load_full();
-		builder = builder.header("User-Agent", client.user_agent());
+		if !client.user_agent().is_empty() {
+			builder = builder.header("User-Agent", client.user_agent());
+		}
 	}
 
 	// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
@@ -216,7 +220,25 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+	// A logged-in session is a www.reddit.com cookie, and the comments API only answers it there
+	if REDDIT_SESSION.is_some() {
+		request(&Method::GET, path, true, quarantine, ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST)
+	} else {
+		request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+	}
+}
+
+/// Cookie header for a request to `host`: the logged-in session (www.reddit.com
+/// only) and the quarantine opt-in.
+fn cookie_header(host: &str, quarantine: bool, session: Option<&str>) -> String {
+	let mut cookies = Vec::new();
+	if let Some(session) = session.filter(|_| host == ALTERNATIVE_REDDIT_URL_BASE_HOST) {
+		cookies.push(format!("reddit_session={session}"));
+	}
+	if quarantine {
+		cookies.push(QUARANTINE_COOKIE.to_string());
+	}
+	cookies.join("; ")
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
@@ -242,17 +264,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 		format!("{base_path}{path}")
 	};
 
-	let mut headers: Vec<(String, String)> = vec![
-		("Host".into(), host.into()),
-		(
-			"Cookie".into(),
-			if quarantine {
-				"_options=%7B%22pref_quarantine_optin%22%3A%20true%2C%20%22pref_gated_sr_optin%22%3A%20true%7D".into()
-			} else {
-				"".into()
-			},
-		),
-	];
+	let mut headers: Vec<(String, String)> = vec![("Host".into(), host.into()), ("Cookie".into(), cookie_header(host, quarantine, REDDIT_SESSION.as_deref()))];
 
 	{
 		let client = OAUTH_CLIENT.load_full();
@@ -336,18 +348,22 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 		Err(format!("{msg}: {e} | {path}"))
 	};
 
+	// A logged-in session gets comments from the API, so it never needs the scraper
+	let session = REDDIT_SESSION.is_some();
+
 	// While the comments API is blocked, skip straight to scraping instead of wasting a request.
 	// Cursors come from scraped pages' "More comments" links, which only the scraper understands.
-	let is_comments = path.contains("/comments/");
+	let is_comments = !session && path.contains("/comments/");
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 	if is_comments && (param(&path, "cursor").is_some() || now < COMMENTS_API_BLOCKED_UNTIL.load(Ordering::Relaxed)) {
 		return Box::pin(crate::shreddit::thread(&path, quarantine)).await;
 	}
 
 	// First, handle rolling over the OAUTH_CLIENT if need be.
+	// A session is one account with one quota, so there is nothing to roll over to.
 	let current_rate_limit = OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst);
 	let is_rolling_over = OAUTH_IS_ROLLING_OVER.load(Ordering::SeqCst);
-	if current_rate_limit < 10 && !is_rolling_over {
+	if current_rate_limit < 10 && !is_rolling_over && !session {
 		warn!("Rate limit {current_rate_limit} is low. Spawning force_refresh_token()");
 		tokio::spawn(force_refresh_token());
 	}
@@ -360,6 +376,11 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 
 			// Reddit's network security block is an HTML page; private/quarantined subs are JSON 403s
 			let is_html = response.headers().get(wreq_header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
+			if session && status == 403 && is_html {
+				// Search is blocked even when logged in; anything else means the session stopped working
+				let hint = "if every page shows this, REDLIB_REDDIT_SESSION has expired or was logged out";
+				return err("Reddit blocked this request", hint.to_string(), path);
+			}
 			if is_comments && status == 403 && is_html {
 				warn!("Comments API blocked, scraping comments for the next {COMMENTS_API_RETRY_SECS}s");
 				COMMENTS_API_BLOCKED_UNTIL.store(now + COMMENTS_API_RETRY_SECS, Ordering::Relaxed);
@@ -475,6 +496,11 @@ async fn self_check(sub: &str) -> Result<(), String> {
 }
 
 pub async fn rate_limit_check() -> Result<(), String> {
+	// The check rotates tokens, which a logged-in session doesn't use
+	if matches!(OAUTH_CLIENT.load().backend, OauthBackendImpl::Session) {
+		return Ok(());
+	}
+
 	// First, test the Oauth client: we can perform a rate limit check if the OAuth backend is MobileSpoof; if GenericWeb, we skip the check.
 	if matches!(OAUTH_CLIENT.load().backend, OauthBackendImpl::GenericWeb(_)) {
 		warn!("[⚠️] Cannot perform rate limit check, running as GenericWeb. Skipping check.");
@@ -587,5 +613,19 @@ mod tests {
 		let link = json("/r/drugs/about.json?raw_json=1".into(), false).await;
 		assert!(link.is_err());
 		assert_eq!(link, Err("gated".into()));
+	}
+
+	#[test]
+	fn test_cookie_header() {
+		assert_eq!(cookie_header(REDDIT_URL_BASE_HOST, false, None), "");
+		assert_eq!(cookie_header(REDDIT_URL_BASE_HOST, true, None), QUARANTINE_COOKIE);
+		assert_eq!(cookie_header(ALTERNATIVE_REDDIT_URL_BASE_HOST, false, Some("abc")), "reddit_session=abc");
+		assert_eq!(
+			cookie_header(ALTERNATIVE_REDDIT_URL_BASE_HOST, true, Some("abc")),
+			format!("reddit_session=abc; {QUARANTINE_COOKIE}")
+		);
+		// The session is a reddit.com cookie, never sent to other hosts
+		assert_eq!(cookie_header(REDDIT_SHORT_URL_BASE_HOST, false, Some("abc")), "");
+		assert_eq!(cookie_header(REDDIT_URL_BASE_HOST, false, Some("abc")), "");
 	}
 }

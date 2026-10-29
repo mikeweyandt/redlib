@@ -44,6 +44,7 @@
    - [launchd (macOS)](#launchd-macos)
 6. [Configuration](#configuration)
    - [Instance settings](#instance-settings)
+   - [Logged-in session](#logged-in-session)
    - [Default user settings](#default-user-settings)
 
 ---
@@ -417,6 +418,20 @@ Assign a default value for each instance-specific setting by passing environment
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
+| `REDDIT_SESSION`          | String          | (empty)                | `reddit_session` cookie of a logged-in reddit.com account, see [Logged-in session](#logged-in-session).   |
+
+## Logged-in session
+
+Reddit blocks most anonymous API requests. With `REDLIB_REDDIT_SESSION` set, Redlib sends every request to
+www.reddit.com as a logged-in account instead of using anonymous OAuth tokens:
+
+1. Log into reddit.com in a browser, ideally from the same network (or VPN) Redlib uses.
+2. Open the developer tools, go to Storage (Firefox) or Application (Chrome) > Cookies > `https://www.reddit.com`
+   and copy the value of `reddit_session`.
+3. Pass it to Redlib as `REDLIB_REDDIT_SESSION`. It lasts until you log out of that browser session.
+
+Everyone using the instance browses as that account, so only do this on a private instance. Search is blocked
+by Reddit even when logged in. If every page reports "Reddit blocked this request", the session has expired.
 
 ## Default user settings
 

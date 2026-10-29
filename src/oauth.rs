@@ -5,7 +5,11 @@ use crate::{
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, trace, warn};
 use serde_json::json;
-use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
+use std::{
+	collections::HashMap,
+	sync::{atomic::Ordering, LazyLock},
+	time::Duration,
+};
 use tegen::tegen::TextGenerator;
 use tokio::time::{error::Elapsed, timeout};
 
@@ -14,6 +18,20 @@ const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 const AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `reddit_session` cookie of a logged-in reddit.com browser session. When set,
+/// requests go to www.reddit.com as that account instead of using an anonymous
+/// OAuth token. Read from the environment directly, not `Config`, so it never
+/// shows up on the instance info page.
+pub static REDDIT_SESSION: LazyLock<Option<String>> = LazyLock::new(|| {
+	std::env::var("REDLIB_REDDIT_SESSION")
+		.ok()
+		.map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+		.filter(|s| !s.is_empty())
+});
+
+/// The session needs no token, so there is nothing to refresh.
+const SESSION_EXPIRES_IN: u64 = 60 * 60 * 24 * 365;
 
 // Response from OAuth backend authentication
 #[derive(Debug, Clone)]
@@ -35,6 +53,8 @@ trait OauthBackend: Send + Sync {
 pub(crate) enum OauthBackendImpl {
 	MobileSpoof(MobileSpoofAuth),
 	GenericWeb(GenericWebAuth),
+	/// Logged-in browser session from `REDDIT_SESSION`, sent as a cookie by `client::request`
+	Session,
 }
 
 impl OauthBackend for OauthBackendImpl {
@@ -42,6 +62,11 @@ impl OauthBackend for OauthBackendImpl {
 		match self {
 			OauthBackendImpl::MobileSpoof(backend) => backend.authenticate().await,
 			OauthBackendImpl::GenericWeb(backend) => backend.authenticate().await,
+			OauthBackendImpl::Session => Ok(OauthResponse {
+				token: String::new(),
+				expires_in: SESSION_EXPIRES_IN,
+				additional_headers: HashMap::new(),
+			}),
 		}
 	}
 
@@ -49,6 +74,8 @@ impl OauthBackend for OauthBackendImpl {
 		match self {
 			OauthBackendImpl::MobileSpoof(backend) => backend.user_agent(),
 			OauthBackendImpl::GenericWeb(backend) => backend.user_agent(),
+			// Keep the browser User-Agent of the client's emulation
+			OauthBackendImpl::Session => "",
 		}
 	}
 
@@ -56,6 +83,7 @@ impl OauthBackend for OauthBackendImpl {
 		match self {
 			OauthBackendImpl::MobileSpoof(backend) => backend.get_headers(),
 			OauthBackendImpl::GenericWeb(backend) => backend.get_headers(),
+			OauthBackendImpl::Session => HashMap::new(),
 		}
 	}
 }
@@ -71,6 +99,15 @@ pub struct Oauth {
 impl Oauth {
 	/// Create a new OAuth client
 	pub(crate) async fn new() -> Self {
+		if REDDIT_SESSION.is_some() {
+			info!("[✅] Using the logged-in reddit.com session from REDLIB_REDDIT_SESSION");
+			return Self {
+				headers_map: HashMap::new(),
+				expires_in: SESSION_EXPIRES_IN,
+				backend: OauthBackendImpl::Session,
+			};
+		}
+
 		// Try MobileSpoofAuth first, then fall back to GenericWebAuth
 		let mut failure_count = 0;
 		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
