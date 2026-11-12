@@ -61,7 +61,7 @@
 				<div class="prefs-group">
 					<label for="post_sort" title="Applies only to subreddit feeds">Default subreddit post sort:</label>
 					<select name="post_sort">
-						{% call utils::options(prefs.post_sort, ["hot", "new", "top", "rising", "controversial"], "hot")
+						{% call utils::options(prefs.post_sort, ["hot", "best", "new", "top", "rising", "controversial"], "hot")
 						%}
 					</select>
 				</div>

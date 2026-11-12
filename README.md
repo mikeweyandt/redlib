@@ -433,6 +433,10 @@ www.reddit.com as a logged-in account instead of using anonymous OAuth tokens:
 Everyone using the instance browses as that account, so only do this on a private instance. Search is blocked
 by Reddit even when logged in. If every page reports "Reddit blocked this request", the session has expired.
 
+Since November 2026 Reddit also refuses sessions the hot, new and rising listings and r/all as JSON. Redlib then
+reads which posts the listing has from its reddit.com page and gets the posts from the API. If that page can't be
+read, the listing shows an error and the log says why ("Couldn't read the listing from its reddit.com page").
+
 ## Default user settings
 
 Assign a default value for each user-modifiable setting by passing environment variables to Redlib in the format `REDLIB_DEFAULT_{Y}`. Replace `{Y}` with the setting name (see list below) in capital letters.

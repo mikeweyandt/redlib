@@ -219,7 +219,7 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
-fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
+pub(crate) fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
 	// A logged-in session is a www.reddit.com cookie, and the comments API only answers it there
 	if REDDIT_SESSION.is_some() {
 		request(&Method::GET, path, true, quarantine, ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST)
@@ -377,6 +377,10 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 			// Reddit's network security block is an HTML page; private/quarantined subs are JSON 403s
 			let is_html = response.headers().get(wreq_header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html"));
 			if session && status == 403 && is_html {
+				// Since November Reddit won't give sessions most listings as JSON, so read them from the page
+				if crate::shreddit::is_feed(&path) {
+					return Box::pin(crate::shreddit::feed(&path, quarantine)).await;
+				}
 				// Search is blocked even when logged in; anything else means the session stopped working
 				let hint = "if every page shows this, REDLIB_REDDIT_SESSION has expired or was logged out";
 				return err("Reddit blocked this request", hint.to_string(), path);

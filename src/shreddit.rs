@@ -6,14 +6,21 @@
 // from the HTML fragments reddit.com loads them from (`/svc/shreddit/...`) and
 // converted into the shape of the `/comments/` JSON response, so post.rs and the
 // templates work unchanged.
+//
+// Since November 2026 Reddit also refuses logged-in sessions most subreddit
+// listings (hot, new, rising, r/all) as JSON. `feed` reads the post order from
+// the listing's reddit.com page and the posts from `/by_id`, in the shape of
+// the listing JSON, so subreddit.rs works unchanged.
 
-use crate::client::{json, CLIENT};
+use crate::client::{json, reddit_get, CLIENT};
 use crate::utils::{format_url, param};
 use chrono::DateTime;
+use log::{error, warn};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::{json as json_value, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
 const SVC_BASE: &str = "https://www.reddit.com/svc/shreddit";
@@ -22,6 +29,15 @@ static COMMENT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-
 static MORE: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="/more-comments/"]"#).unwrap());
 static CURSOR: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"input[name="cursor"]"#).unwrap());
 static MORE_COUNT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("faceplate-number[number]").unwrap());
+
+static POST: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-post").unwrap());
+static MORE_POSTS: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="-more-posts/"]"#).unwrap());
+
+/// Sorts of the listing pages `listing` reads.
+const SORTS: [&str; 6] = ["hot", "best", "new", "rising", "top", "controversial"];
+
+/// Set once a listing has been read from a page, to log that it works only once.
+static LISTING_WORKS: AtomicBool = AtomicBool::new(false);
 
 /// Builds a `/comments/` JSON response for `path` (a `/comments/` API path, as
 /// built by `post::item`). Supports the `sort` and `cursor` query parameters
@@ -101,6 +117,101 @@ async fn more(sub: &str, id: &str, cursor: &str, quarantine: bool) -> Result<Str
 		return Err(format!("Reddit returned {} for more comments | {url}", res.status()));
 	}
 	res.text().await.map_err(|e| e.to_string())
+}
+
+/// Whether `path` is a subreddit listing API path, `/r/{subs}/{sort}.json?...`
+/// as built by `subreddit::community`.
+pub fn is_feed(path: &str) -> bool {
+	feed_parts(path).is_some()
+}
+
+/// The subreddits and sort of a listing API path.
+fn feed_parts(path: &str) -> Option<(&str, &str)> {
+	let rest = path.split('?').next()?.strip_prefix("/r/")?.strip_suffix(".json")?;
+	let (subs, sort) = rest.split_once('/')?;
+	(!subs.is_empty() && SORTS.contains(&sort)).then_some((subs, sort))
+}
+
+/// Builds a listing JSON response for `path` (see `is_feed`) from the
+/// reddit.com page, for the listings Reddit no longer gives logged-in sessions
+/// as JSON. The page gives the posts and their order, `/by_id` their data.
+pub async fn feed(path: &str, quarantine: bool) -> Result<Value, String> {
+	let failed = |why: String| -> Result<Value, String> {
+		error!("Couldn't read the listing from its reddit.com page: {why} | {path}");
+		Err(format!("Reddit blocked this listing and its page couldn't be read: {why} | {path}"))
+	};
+
+	let Some(page) = page_path(path) else {
+		return failed("unknown listing".into());
+	};
+	let html = match reddit_get(page, quarantine).await {
+		Ok(res) if res.status().is_success() => match res.text().await {
+			Ok(html) => html,
+			Err(e) => return failed(e.to_string()),
+		},
+		Ok(res) => return failed(format!("the page returned {}", res.status())),
+		Err(e) => return failed(e),
+	};
+
+	let (ids, after) = parse_feed(&html);
+	if ids.is_empty() {
+		return failed("0 posts on the page".into());
+	}
+
+	let posts = match json(format!("/by_id/{}.json?raw_json=1", ids.join(",")), quarantine).await {
+		Ok(posts) => posts,
+		Err(e) => return failed(format!("post data: {e}")),
+	};
+	let mut by_name: HashMap<String, Value> = posts["data"]["children"]
+		.as_array()
+		.into_iter()
+		.flatten()
+		.filter_map(|p| Some((p["data"]["name"].as_str()?.to_string(), p.clone())))
+		.collect();
+	let children: Vec<Value> = ids.iter().filter_map(|id| by_name.remove(id)).collect();
+
+	if !LISTING_WORKS.swap(true, Ordering::Relaxed) {
+		warn!("Reading listings from their reddit.com pages, Reddit refuses them to the session as JSON");
+	}
+	Ok(json_value!({ "kind": "Listing", "data": { "children": children, "after": after } }))
+}
+
+/// The reddit.com page of a listing API path. Later pages are the fragment the
+/// page's infinite scroll loads, which `parse_feed` passes on as the cursor.
+fn page_path(path: &str) -> Option<String> {
+	if let Some(after) = param(path, "after").filter(|a| a.starts_with("/svc/shreddit/")) {
+		return Some(after);
+	}
+	let (subs, sort) = feed_parts(path)?;
+	let query: Vec<String> = ["t", "geo_filter"]
+		.into_iter()
+		.filter_map(|name| {
+			param(path, name)
+				.filter(|v| !v.is_empty())
+				.map(|v| format!("{name}={}", utf8_percent_encode(&v, NON_ALPHANUMERIC)))
+		})
+		.collect();
+	Some(format!("/r/{subs}/{sort}/?{}", query.join("&")))
+}
+
+/// The post IDs on a listing page or fragment in order, and the cursor of the
+/// next page: the fragment its infinite scroll loads, percent-encoded.
+fn parse_feed(html: &str) -> (Vec<String>, String) {
+	let doc = Html::parse_document(html);
+	let mut ids: Vec<String> = Vec::new();
+	for el in doc.select(&POST) {
+		let id = el.value().attr("id").unwrap_or_default();
+		if id.starts_with("t3_") && !ids.iter().any(|i| i == id) {
+			ids.push(id.to_string());
+		}
+	}
+	let after = doc
+		.select(&MORE_POSTS)
+		.filter_map(|el| el.value().attr("src"))
+		.find(|src| src.starts_with("/svc/shreddit/"))
+		.map(|src| utf8_percent_encode(src, NON_ALPHANUMERIC).to_string())
+		.unwrap_or_default();
+	(ids, after)
 }
 
 fn listing(children: Vec<Value>) -> Value {
@@ -330,6 +441,59 @@ mod tests {
 		assert_eq!(parse_path("/comments/1xaxcyl/comments/abc.json?"), Some(("1xaxcyl".into(), Some("abc".into()))));
 		assert_eq!(parse_path("/user/spez/comments/1xaxcyl.json?"), Some(("1xaxcyl".into(), None)));
 		assert_eq!(parse_path("/r/linux/hot.json"), None);
+	}
+
+	#[test]
+	fn test_is_feed() {
+		assert!(is_feed("/r/2007scape/hot.json?&raw_json=1"));
+		assert!(is_feed("/r/2007scape%2Bironscape/new.json?sort=new&t=&after=&raw_json=1"));
+		assert!(is_feed("/r/all/top.json?t=week&raw_json=1"));
+		assert!(!is_feed("/r/2007scape/about.json?raw_json=1"));
+		assert!(!is_feed("/r/2007scape/comments/1xtx10k.json?raw_json=1"));
+		assert!(!is_feed("/r/2007scape/search.json?q=birds"));
+		assert!(!is_feed("/by_id/t3_a,t3_b.json?raw_json=1"));
+		assert!(!is_feed("/user/spez/hot.json"));
+	}
+
+	#[test]
+	fn test_page_path() {
+		assert_eq!(page_path("/r/2007scape/hot.json?&raw_json=1").as_deref(), Some("/r/2007scape/hot/?"));
+		assert_eq!(page_path("/r/a%2Bb/top.json?sort=top&t=week&raw_json=1").as_deref(), Some("/r/a%2Bb/top/?t=week"));
+		assert_eq!(
+			page_path("/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL").as_deref(),
+			Some("/r/popular/hot/?geo_filter=GLOBAL")
+		);
+		// Later pages: the fragment the cursor names
+		assert_eq!(
+			page_path("/r/2007scape/hot.json?after=%2Fsvc%2Fshreddit%2Fcommunity%2Dmore%2Dposts%2Fhot%2F%3Fafter%3DdDNfYQ%253D%253D%26name%3D2007scape&raw_json=1").as_deref(),
+			Some("/svc/shreddit/community-more-posts/hot/?after=dDNfYQ%3D%3D&name=2007scape")
+		);
+		// A JSON API cursor isn't a page; start from the first one
+		assert_eq!(page_path("/r/2007scape/hot.json?after=t3_abc&raw_json=1").as_deref(), Some("/r/2007scape/hot/?"));
+		assert_eq!(page_path("/r/2007scape/about.json"), None);
+	}
+
+	#[test]
+	fn test_parse_feed() {
+		let html = r#"
+<shreddit-feed>
+  <article><shreddit-post id="t3_a1" post-title="Pinned" author="mod" score="10" permalink="/r/2007scape/comments/a1/pinned/"></shreddit-post></article>
+  <shreddit-ad-post id="t3_ad"></shreddit-ad-post>
+  <article><shreddit-post id="t3_a2" post-title="Birds" author="bob" score="99" permalink="/r/2007scape/comments/a2/birds/"></shreddit-post></article>
+  <article><shreddit-post id="t3_a1"></shreddit-post></article>
+  <faceplate-partial loading="programmatic" src="/svc/shreddit/community-more-posts/hot/?after=dDNfYTI%3D&amp;name=2007scape"></faceplate-partial>
+</shreddit-feed>"#;
+		let (ids, after) = parse_feed(html);
+		// Ads and repeats are left out
+		assert_eq!(ids, ["t3_a1", "t3_a2"]);
+		assert_eq!(after, "%2Fsvc%2Fshreddit%2Fcommunity%2Dmore%2Dposts%2Fhot%2F%3Fafter%3DdDNfYTI%253D%26name%3D2007scape");
+		// The cursor leads back to the fragment
+		assert_eq!(
+			page_path(&format!("/r/2007scape/hot.json?after={after}&raw_json=1")).as_deref(),
+			Some("/svc/shreddit/community-more-posts/hot/?after=dDNfYTI%3D&name=2007scape")
+		);
+
+		assert_eq!(parse_feed("<html><body>Please wait for verification</body></html>"), (vec![], String::new()));
 	}
 
 	#[test]
