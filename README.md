@@ -433,9 +433,12 @@ www.reddit.com as a logged-in account instead of using anonymous OAuth tokens:
 Everyone using the instance browses as that account, so only do this on a private instance. Search is blocked
 by Reddit even when logged in. If every page reports "Reddit blocked this request", the session has expired.
 
-Since November 2026 Reddit also refuses sessions the hot, new and rising listings and r/all as JSON. Redlib then
-reads which posts the listing has from its reddit.com page and gets the posts from the API. If that page can't be
-read, the listing shows an error and the log says why ("Couldn't read the listing from its reddit.com page").
+Since November 2026 Reddit also refuses sessions the hot, new and rising listings as JSON. Redlib then reads them
+from the HTML feed reddit.com's subreddit pages load their posts from. reddit.com has no feed for several
+subreddits at once, so a multireddit (like a front page of subscriptions) loads each subreddit's feed and merges
+them: by time for new, by Reddit's hot ranking for hot and rising. Feeds are cached for two minutes, as every page
+of a multireddit loads each of its subreddits. Videos in these listings play as HLS only. If a feed can't be read,
+the log says why ("Couldn't read the r/... listing from reddit.com").
 
 ## Default user settings
 

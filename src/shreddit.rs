@@ -8,12 +8,13 @@
 // templates work unchanged.
 //
 // Since November 2026 Reddit also refuses logged-in sessions most subreddit
-// listings (hot, new, rising, r/all) as JSON. `feed` reads the post order from
-// the listing's reddit.com page and the posts from `/by_id`, in the shape of
-// the listing JSON, so subreddit.rs works unchanged.
+// listings (hot, new, rising, r/all) as JSON, and `/by_id` too. `feed` builds
+// them from the HTML fragments reddit.com's subreddit pages load their posts
+// from, in the shape of the listing JSON, so subreddit.rs works unchanged.
 
 use crate::client::{json, reddit_get, CLIENT};
 use crate::utils::{format_url, param};
+use cached::proc_macro::cached;
 use chrono::DateTime;
 use log::{error, warn};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -32,9 +33,16 @@ static MORE_COUNT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("facepl
 
 static POST: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-post").unwrap());
 static MORE_POSTS: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="-more-posts/"]"#).unwrap());
+static FLAIR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-post-flair").unwrap());
+static PRIMARY_IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[data-post-media-primary]").unwrap());
+static PLAYER: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-player, shreddit-player-2").unwrap());
+static GALLERY_IMAGE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("gallery-carousel img").unwrap());
 
-/// Sorts of the listing pages `listing` reads.
+/// Sorts of the listings `feed` reads.
 const SORTS: [&str; 6] = ["hot", "best", "new", "rising", "top", "controversial"];
+
+/// Posts per page of a merged listing, as many as the JSON API's.
+const PAGE_SIZE: usize = 25;
 
 /// Set once a listing has been read from a page, to log that it works only once.
 static LISTING_WORKS: AtomicBool = AtomicBool::new(false);
@@ -126,92 +134,290 @@ pub fn is_feed(path: &str) -> bool {
 }
 
 /// The subreddits and sort of a listing API path.
-fn feed_parts(path: &str) -> Option<(&str, &str)> {
+fn feed_parts(path: &str) -> Option<(Vec<String>, &str)> {
 	let rest = path.split('?').next()?.strip_prefix("/r/")?.strip_suffix(".json")?;
 	let (subs, sort) = rest.split_once('/')?;
+	let subs: Vec<String> = subs
+		.replace("%2B", "+")
+		.replace("%2b", "+")
+		.split('+')
+		.filter(|s| !s.is_empty())
+		.map(str::to_string)
+		.collect();
 	(!subs.is_empty() && SORTS.contains(&sort)).then_some((subs, sort))
 }
 
-/// Builds a listing JSON response for `path` (see `is_feed`) from the
-/// reddit.com page, for the listings Reddit no longer gives logged-in sessions
-/// as JSON. The page gives the posts and their order, `/by_id` their data.
+/// Builds a listing JSON response for `path` (see `is_feed`) from the HTML
+/// fragments reddit.com's subreddit pages load their posts from, for the
+/// listings Reddit no longer gives logged-in sessions as JSON.
+///
+/// reddit.com has no such feed for several subreddits at once, so a
+/// multireddit merges its subreddits' feeds and its `after` holds a cursor per
+/// subreddit.
 pub async fn feed(path: &str, quarantine: bool) -> Result<Value, String> {
-	let failed = |why: String| -> Result<Value, String> {
-		error!("Couldn't read the listing from its reddit.com page: {why} | {path}");
-		Err(format!("Reddit blocked this listing and its page couldn't be read: {why} | {path}"))
+	let Some((subs, sort)) = feed_parts(path) else {
+		return Err(format!("Unknown listing | {path}"));
 	};
+	let t = param(path, "t").filter(|t| !t.is_empty()).unwrap_or_else(|| "day".to_string()).to_uppercase();
+	let cursors = parse_cursors(&param(path, "after").unwrap_or_default(), &subs);
 
-	let Some(page) = page_path(path) else {
-		return failed("unknown listing".into());
-	};
-	let html = match reddit_get(page, quarantine).await {
-		Ok(res) if res.status().is_success() => match res.text().await {
-			Ok(html) => html,
-			Err(e) => return failed(e.to_string()),
-		},
-		Ok(res) => return failed(format!("the page returned {}", res.status())),
-		Err(e) => return failed(e),
-	};
+	// Load the subreddits' feeds in parallel
+	let tasks: Vec<_> = subs
+		.iter()
+		.map(|sub| {
+			let (sub, sort, t) = (sub.clone(), sort.to_string(), t.clone());
+			let after = cursors.get(&sub.to_lowercase()).cloned().unwrap_or_default();
+			tokio::spawn(async move {
+				let posts = batch(sub.clone(), sort, t, after, quarantine).await;
+				(sub, posts)
+			})
+		})
+		.collect();
 
-	let (ids, after) = parse_feed(&html);
-	if ids.is_empty() {
-		return failed("0 posts on the page".into());
+	let mut feeds = Vec::new();
+	let mut errors = Vec::new();
+	for task in tasks {
+		match task.await {
+			Ok((sub, Ok((posts, more)))) => feeds.push((sub, posts, more)),
+			Ok((sub, Err(e))) => {
+				error!("Couldn't read the r/{sub} listing from reddit.com: {e} | {path}");
+				errors.push(format!("r/{sub}: {e}"));
+			}
+			Err(e) => errors.push(e.to_string()),
+		}
+	}
+	if feeds.is_empty() {
+		return Err(format!(
+			"Reddit blocked this listing, and reading it from reddit.com failed: {} | {path}",
+			errors.join("; ")
+		));
 	}
 
-	let posts = match json(format!("/by_id/{}.json?raw_json=1", ids.join(",")), quarantine).await {
-		Ok(posts) => posts,
-		Err(e) => return failed(format!("post data: {e}")),
+	let (children, next) = merge(feeds, sort, cursors);
+	let after = if next.is_empty() {
+		String::new()
+	} else if subs.len() == 1 {
+		// A single subreddit's cursor is a post, like the JSON API's
+		next.into_values().next().unwrap_or_default()
+	} else {
+		subs
+			.iter()
+			.filter_map(|sub| next.get(&sub.to_lowercase()).map(|id| format!("{sub}:{id}")))
+			.collect::<Vec<_>>()
+			.join(",")
 	};
-	let mut by_name: HashMap<String, Value> = posts["data"]["children"]
-		.as_array()
-		.into_iter()
-		.flatten()
-		.filter_map(|p| Some((p["data"]["name"].as_str()?.to_string(), p.clone())))
-		.collect();
-	let children: Vec<Value> = ids.iter().filter_map(|id| by_name.remove(id)).collect();
 
 	if !LISTING_WORKS.swap(true, Ordering::Relaxed) {
-		warn!("Reading listings from their reddit.com pages, Reddit refuses them to the session as JSON");
+		warn!("Reading listings from reddit.com's feeds, as Reddit refuses them to the session as JSON");
 	}
 	Ok(json_value!({ "kind": "Listing", "data": { "children": children, "after": after } }))
 }
 
-/// The reddit.com page of a listing API path. Later pages are the fragment the
-/// page's infinite scroll loads, which `parse_feed` passes on as the cursor.
-fn page_path(path: &str) -> Option<String> {
-	if let Some(after) = param(path, "after").filter(|a| a.starts_with("/svc/shreddit/")) {
-		return Some(after);
-	}
-	let (subs, sort) = feed_parts(path)?;
-	let query: Vec<String> = ["t", "geo_filter"]
-		.into_iter()
-		.filter_map(|name| {
-			param(path, name)
-				.filter(|v| !v.is_empty())
-				.map(|v| format!("{name}={}", utf8_percent_encode(&v, NON_ALPHANUMERIC)))
+/// The cursor of each subreddit in a listing's `after`, keyed by lowercase
+/// name: `sub:t3_id,sub:t3_id`, or a bare `t3_id` for a single subreddit.
+fn parse_cursors(after: &str, subs: &[String]) -> HashMap<String, String> {
+	after
+		.split(',')
+		.filter_map(|cursor| {
+			let (sub, id) = match cursor.split_once(':') {
+				Some((sub, id)) => (sub.to_lowercase(), id),
+				None if subs.len() == 1 => (subs[0].to_lowercase(), cursor),
+				None => return None,
+			};
+			id.starts_with("t3_").then(|| (sub, id.to_string()))
 		})
-		.collect();
-	Some(format!("/r/{subs}/{sort}/?{}", query.join("&")))
+		.collect()
 }
 
-/// The post IDs on a listing page or fragment in order, and the cursor of the
-/// next page: the fragment its infinite scroll loads, percent-encoded.
-fn parse_feed(html: &str) -> (Vec<String>, String) {
-	let doc = Html::parse_document(html);
-	let mut ids: Vec<String> = Vec::new();
-	for el in doc.select(&POST) {
-		let id = el.value().attr("id").unwrap_or_default();
-		if id.starts_with("t3_") && !ids.iter().any(|i| i == id) {
-			ids.push(id.to_string());
+/// Merges subreddits' feeds (name, posts, whether more follow) into a page,
+/// keeping each feed's own order: the next post is the best of the feeds' next
+/// ones, so each feed's cursor stays the last post taken from it. Stops early
+/// when a feed with more pages runs out, as its next posts are unknown.
+/// Returns the page and the cursors for the next one, empty at the end.
+fn merge(feeds: Vec<(String, Vec<Value>, bool)>, sort: &str, mut cursors: HashMap<String, String>) -> (Vec<Value>, HashMap<String, String>) {
+	let key = |post: &Value| -> f64 {
+		let data = &post["data"];
+		let score = data["score"].as_f64().unwrap_or_default();
+		let created = data["created_utc"].as_f64().unwrap_or_default();
+		match sort {
+			"new" => created,
+			"hot" | "rising" => hot(score, created),
+			_ => score,
+		}
+	};
+
+	let mut taken = vec![0; feeds.len()];
+	let mut page = Vec::new();
+	while page.len() < PAGE_SIZE {
+		let next = (0..feeds.len())
+			.filter(|&i| taken[i] < feeds[i].1.len())
+			.max_by(|&a, &b| key(&feeds[a].1[taken[a]]).total_cmp(&key(&feeds[b].1[taken[b]])).then(b.cmp(&a)));
+		let Some(i) = next else { break };
+		let post = &feeds[i].1[taken[i]];
+		cursors.insert(feeds[i].0.to_lowercase(), post["data"]["name"].as_str().unwrap_or_default().to_string());
+		page.push(post.clone());
+		taken[i] += 1;
+		if taken[i] == feeds[i].1.len() && feeds[i].2 {
+			break;
 		}
 	}
-	let after = doc
-		.select(&MORE_POSTS)
-		.filter_map(|el| el.value().attr("src"))
-		.find(|src| src.starts_with("/svc/shreddit/"))
-		.map(|src| utf8_percent_encode(src, NON_ALPHANUMERIC).to_string())
-		.unwrap_or_default();
-	(ids, after)
+
+	let more = feeds.iter().zip(&taken).any(|((_, posts, more), &taken)| taken < posts.len() || *more);
+	(page, if more { cursors } else { HashMap::new() })
+}
+
+/// Reddit's hot ranking: the order of magnitude of the score plus the age,
+/// where 12.5 hours are worth a tenfold score.
+fn hot(score: f64, created: f64) -> f64 {
+	score.signum() * score.abs().max(1.0).log10() + (created - 1_134_028_003.0) / 45_000.0
+}
+
+/// A subreddit's posts after `after` (a post, empty for the first) from the
+/// fragment its reddit.com page loads them from, and whether more follow.
+/// Cached briefly, as a merged listing loads every subreddit for each page.
+#[cached(size = 256, time = 120, result = true)]
+async fn batch(sub: String, sort: String, t: String, after: String, quarantine: bool) -> Result<(Vec<Value>, bool), String> {
+	let mut path = format!("/svc/shreddit/community-more-posts/{sort}/?name={}&t={t}", utf8_percent_encode(&sub, NON_ALPHANUMERIC));
+	if !after.is_empty() {
+		use base64::{engine::general_purpose::STANDARD, Engine as _};
+		path += &format!("&after={}", utf8_percent_encode(&STANDARD.encode(&after), NON_ALPHANUMERIC));
+	}
+	let res = reddit_get(path, quarantine).await?;
+	if !res.status().is_success() {
+		return Err(format!("reddit.com returned {}", res.status()));
+	}
+	let html = res.text().await.map_err(|e| e.to_string())?;
+	let (posts, more) = parse_feed(&html);
+	if posts.is_empty() && after.is_empty() {
+		return Err("0 posts in reddit.com's feed".to_string());
+	}
+	Ok((posts, more))
+}
+
+/// The posts of a feed fragment in order, and whether it links to more.
+fn parse_feed(html: &str) -> (Vec<Value>, bool) {
+	let doc = Html::parse_document(html);
+	let mut seen = std::collections::HashSet::new();
+	let posts = doc
+		.select(&POST)
+		// Leave out the original posts shown inside crossposts
+		.filter(|el| !el.ancestors().any(|a| a.value().as_element().is_some_and(|e| e.name() == "shreddit-post")))
+		.filter_map(post_json)
+		.filter(|post| seen.insert(post["data"]["name"].as_str().unwrap_or_default().to_string()))
+		.collect();
+	(posts, doc.select(&MORE_POSTS).next().is_some())
+}
+
+/// A feed's `<shreddit-post>` as a post of the listing JSON, with the fields
+/// `Post::fetch` and `Media::parse` read.
+fn post_json(el: ElementRef) -> Option<Value> {
+	let attr = |name: &str| el.value().attr(name).unwrap_or_default();
+	let fullname = attr("id");
+	let id = fullname.strip_prefix("t3_")?;
+	let created = DateTime::parse_from_str(attr("created-timestamp"), "%Y-%m-%dT%H:%M:%S%.f%z").map_or(0, |t| t.timestamp());
+
+	let mut data = json_value!({
+		"id": id,
+		"name": fullname,
+		"title": attr("post-title"),
+		"author": attr("author"),
+		"subreddit": attr("subreddit-name"),
+		"permalink": attr("permalink"),
+		"url": attr("content-href"),
+		"domain": attr("domain"),
+		"score": attr("score").parse::<i64>().unwrap_or_default(),
+		"upvote_ratio": attr("upvote-ratio").parse::<f64>().unwrap_or(1.0),
+		"num_comments": attr("comment-count").parse::<i64>().unwrap_or_default(),
+		"created_utc": created,
+		"over_18": el.value().attr("nsfw").is_some(),
+		"spoiler": el.value().attr("spoiler").is_some(),
+	});
+
+	if let Some(flair) = el.select(&FLAIR).next() {
+		let text = flair.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+		if !text.is_empty() {
+			data["link_flair_type"] = "text".into();
+			data["link_flair_text"] = text.into();
+		}
+	}
+
+	let primary = el.select(&PRIMARY_IMAGE).next();
+	let source = |img: ElementRef| {
+		let size = |name: &str| img.value().attr(name).and_then(|v| v.parse::<i64>().ok()).unwrap_or_default();
+		json_value!({ "url": img.value().attr("src").unwrap_or_default(), "width": size("width"), "height": size("height") })
+	};
+
+	match attr("post-type") {
+		"text" => {
+			data["is_self"] = true.into();
+			let body = Selector::parse(&format!(r#"[id="{fullname}-post-rtjson-content"]"#))
+				.ok()
+				.and_then(|s| el.select(&s).next())
+				.map(clean_html)
+				.unwrap_or_default();
+			if !body.is_empty() {
+				data["selftext_html"] = format!("<div class=\"md\">{body}</div>").into();
+			}
+		}
+		"image" => {
+			data["post_hint"] = "image".into();
+			if let Some(img) = primary {
+				data["preview"] = json_value!({ "images": [{ "source": source(img) }] });
+			}
+		}
+		"gallery" => {
+			let (items, metadata) = gallery(el);
+			data["is_gallery"] = true.into();
+			data["gallery_data"] = json_value!({ "items": items });
+			data["media_metadata"] = metadata;
+		}
+		"video" => {
+			if let Some(player) = el.select(&PLAYER).next() {
+				// The feed names no MP4 but a 96p preview, so the HLS stream stands in for it
+				let hls = player.value().attr("src").unwrap_or_default();
+				data["secure_media"] = json_value!({ "reddit_video": { "fallback_url": hls, "hls_url": hls, "is_gif": false } });
+				data["preview"] = json_value!({ "images": [{ "source": { "url": player.value().attr("poster").unwrap_or_default() } }] });
+			}
+		}
+		_ => {
+			data["post_hint"] = "link".into();
+			if let Some(img) = primary {
+				let thumbnail = source(img);
+				data["thumbnail"] = thumbnail["url"].clone();
+				data["thumbnail_width"] = thumbnail["width"].clone();
+				data["thumbnail_height"] = thumbnail["height"].clone();
+			}
+		}
+	}
+
+	Some(json_value!({ "kind": "t3", "data": data }))
+}
+
+/// The `gallery_data` items and `media_metadata` of a gallery post. Each
+/// slide's full image is an i.redd.it `<img>`, after preview images that carry
+/// its size.
+fn gallery(el: ElementRef) -> (Vec<Value>, Value) {
+	let mut items = Vec::new();
+	let mut metadata = serde_json::Map::new();
+	let (mut width, mut height) = (0, 0);
+	for img in el.select(&GALLERY_IMAGE) {
+		let size = |name: &str| img.value().attr(name).and_then(|v| v.parse::<i64>().ok());
+		if let (Some(w), Some(h)) = (size("width"), size("height")) {
+			(width, height) = (w, h);
+		}
+		let src = img.value().attr("src").unwrap_or_default();
+		let Some(file) = src.strip_prefix("https://i.redd.it/") else { continue };
+		let Some((media_id, ext)) = file.split('?').next().and_then(|f| f.split_once('.')) else {
+			continue;
+		};
+		if metadata.contains_key(media_id) {
+			continue;
+		}
+		let mime = if ext == "gif" { "image/gif".to_string() } else { format!("image/{ext}") };
+		items.push(json_value!({ "media_id": media_id }));
+		metadata.insert(media_id.to_string(), json_value!({ "m": mime, "s": { "u": src, "gif": src, "x": width, "y": height } }));
+	}
+	(items, Value::Object(metadata))
 }
 
 fn listing(children: Vec<Value>) -> Value {
@@ -446,6 +652,7 @@ mod tests {
 	#[test]
 	fn test_is_feed() {
 		assert!(is_feed("/r/2007scape/hot.json?&raw_json=1"));
+		assert!(is_feed("/r/2007scape%2BBankTabs/rising.json?&raw_json=1"));
 		assert!(is_feed("/r/2007scape%2Bironscape/new.json?sort=new&t=&after=&raw_json=1"));
 		assert!(is_feed("/r/all/top.json?t=week&raw_json=1"));
 		assert!(!is_feed("/r/2007scape/about.json?raw_json=1"));
@@ -456,44 +663,177 @@ mod tests {
 	}
 
 	#[test]
-	fn test_page_path() {
-		assert_eq!(page_path("/r/2007scape/hot.json?&raw_json=1").as_deref(), Some("/r/2007scape/hot/?"));
-		assert_eq!(page_path("/r/a%2Bb/top.json?sort=top&t=week&raw_json=1").as_deref(), Some("/r/a%2Bb/top/?t=week"));
-		assert_eq!(
-			page_path("/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL").as_deref(),
-			Some("/r/popular/hot/?geo_filter=GLOBAL")
-		);
-		// Later pages: the fragment the cursor names
-		assert_eq!(
-			page_path("/r/2007scape/hot.json?after=%2Fsvc%2Fshreddit%2Fcommunity%2Dmore%2Dposts%2Fhot%2F%3Fafter%3DdDNfYQ%253D%253D%26name%3D2007scape&raw_json=1").as_deref(),
-			Some("/svc/shreddit/community-more-posts/hot/?after=dDNfYQ%3D%3D&name=2007scape")
-		);
-		// A JSON API cursor isn't a page; start from the first one
-		assert_eq!(page_path("/r/2007scape/hot.json?after=t3_abc&raw_json=1").as_deref(), Some("/r/2007scape/hot/?"));
-		assert_eq!(page_path("/r/2007scape/about.json"), None);
+	fn test_feed_parts() {
+		let subs = |path: &str| feed_parts(path).map(|(subs, sort)| (subs.join(" "), sort.to_string()));
+		assert_eq!(subs("/r/2007scape/hot.json?&raw_json=1"), Some(("2007scape".into(), "hot".into())));
+		assert_eq!(subs("/r/2007scape%2Bironscape/new.json?after="), Some(("2007scape ironscape".into(), "new".into())));
+		assert_eq!(subs("/r/a+b/rising.json"), Some(("a b".into(), "rising".into())));
 	}
 
 	#[test]
-	fn test_parse_feed() {
-		let html = r#"
-<shreddit-feed>
-  <article><shreddit-post id="t3_a1" post-title="Pinned" author="mod" score="10" permalink="/r/2007scape/comments/a1/pinned/"></shreddit-post></article>
-  <shreddit-ad-post id="t3_ad"></shreddit-ad-post>
-  <article><shreddit-post id="t3_a2" post-title="Birds" author="bob" score="99" permalink="/r/2007scape/comments/a2/birds/"></shreddit-post></article>
-  <article><shreddit-post id="t3_a1"></shreddit-post></article>
-  <faceplate-partial loading="programmatic" src="/svc/shreddit/community-more-posts/hot/?after=dDNfYTI%3D&amp;name=2007scape"></faceplate-partial>
-</shreddit-feed>"#;
-		let (ids, after) = parse_feed(html);
-		// Ads and repeats are left out
-		assert_eq!(ids, ["t3_a1", "t3_a2"]);
-		assert_eq!(after, "%2Fsvc%2Fshreddit%2Fcommunity%2Dmore%2Dposts%2Fhot%2F%3Fafter%3DdDNfYTI%253D%26name%3D2007scape");
-		// The cursor leads back to the fragment
+	fn test_parse_cursors() {
+		let one = vec!["2007scape".to_string()];
+		let two = vec!["2007scape".to_string(), "BankTabs".to_string()];
+		assert_eq!(parse_cursors("t3_a", &one), HashMap::from([("2007scape".into(), "t3_a".into())]));
+		assert_eq!(parse_cursors("", &one), HashMap::new());
 		assert_eq!(
-			page_path(&format!("/r/2007scape/hot.json?after={after}&raw_json=1")).as_deref(),
-			Some("/svc/shreddit/community-more-posts/hot/?after=dDNfYTI%3D&name=2007scape")
+			parse_cursors("2007scape:t3_a,BankTabs:t3_b", &two),
+			HashMap::from([("2007scape".into(), "t3_a".into()), ("banktabs".into(), "t3_b".into())])
+		);
+		// A bare post or a JSON API cursor can't be told apart between subreddits
+		assert_eq!(parse_cursors("t3_a", &two), HashMap::new());
+		assert_eq!(parse_cursors("2007scape:xyz", &two), HashMap::new());
+	}
+
+	#[test]
+	fn test_merge() {
+		let post = |name: &str, score: i64, created: i64| json_value!({ "kind": "t3", "data": { "name": name, "score": score, "created_utc": created } });
+		let names = |page: &[Value]| page.iter().map(|p| p["data"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+		let day = 86_400;
+		let a = ("a".to_string(), vec![post("t3_a1", 5000, 10 * day), post("t3_a2", 10, 10 * day)], true);
+		let b = ("b".to_string(), vec![post("t3_b1", 100, 10 * day + day / 4), post("t3_b2", 1, 9 * day)], false);
+
+		// Hot: a1's score outweighs b1's 6 hours; each feed keeps its own order
+		let (page, next) = merge(vec![a.clone(), b.clone()], "hot", HashMap::new());
+		assert_eq!(names(&page), ["t3_a1", "t3_b1", "t3_a2"]);
+		// a ran out and has more pages, so the page stops there
+		assert_eq!(next, HashMap::from([("a".into(), "t3_a2".into()), ("b".into(), "t3_b1".into())]));
+
+		let (page, _) = merge(vec![a, b.clone()], "new", HashMap::new());
+		assert_eq!(names(&page), ["t3_b1", "t3_a1", "t3_a2"]);
+
+		// The end of every feed: no cursor
+		let (page, next) = merge(vec![b], "hot", HashMap::from([("a".into(), "t3_a9".into())]));
+		assert_eq!(names(&page), ["t3_b1", "t3_b2"]);
+		assert!(next.is_empty());
+	}
+
+	/// Trimmed from a reddit.com feed fragment (`/svc/shreddit/community-more-posts/hot/?name=2007scape`)
+	const FEED: &str = r#"
+<article><shreddit-post permalink="/r/2007scape/comments/1xtvofg/for_the_first_time_in_years_scythe_has_dropped/" content-href="https://i.redd.it/69w23zll721i1.jpeg" comment-count="93" created-timestamp="2026-11-11T22:27:08.239000+0000" domain="i.redd.it" id="t3_1xtvofg" post-title="For the first time in years, Scythe has dropped below 1b" post-type="image" score="504" upvote-ratio="0.9701492537313433" subreddit-prefixed-name="r/2007scape" author="alice" subreddit-name="2007scape">
+  <shreddit-post-flair slot="post-flair" post-id="t3_1xtvofg"><a href="/r/2007scape/?f=flair_name%3A%22Other%22"><span><div aria-label="Flair: Other" dir="auto"> Other </div></span></a></shreddit-post-flair>
+  <div slot="post-media-container"><shreddit-aspect-ratio><img alt="" role="presentation" src="https://preview.redd.it/x-v0-69w23zll721i1.jpeg?width=640&amp;crop=smart&amp;auto=webp&amp;s=ea58" width="640" height="383"><img data-post-media-primary alt="r/2007scape - For the first time in years" src="https://preview.redd.it/x-v0-69w23zll721i1.jpeg?width=640&amp;crop=smart&amp;auto=webp&amp;s=ea58" width="640" height="383"></shreddit-aspect-ratio></div>
+</shreddit-post></article>
+<shreddit-ad-post id="t3_ad"><img data-post-media-primary src="https://preview.redd.it/ad.jpeg"></shreddit-ad-post>
+<article><shreddit-post permalink="/r/2007scape/comments/1xtxzng/psa_duo_tfa/" content-href="https://www.reddit.com/r/2007scape/comments/1xtxzng/psa_duo_tfa/" comment-count="71" created-timestamp="2026-11-12T00:06:59.149000+0000" domain="self.2007scape" id="t3_1xtxzng" post-title="PSA: Duo TFA" post-type="text" score="335" upvote-ratio="0.85" subreddit-prefixed-name="r/2007scape" author="bob" subreddit-name="2007scape" spoiler>
+  <a href="/r/2007scape/comments/1xtxzng/psa_duo_tfa/" slot="text-body"><div data-post-click-location="text-body"><div id="t3_1xtxzng-post-rtjson-content" about="t3_1xtxzng" property="schema:articleBody" dir="auto"><p class="mb-sm"> Grab a guy from the lobby. </p><p> purples are 28% better </p></div></div></a>
+</shreddit-post></article>
+<article><shreddit-post permalink="/r/2007scape/comments/1xtrqx2/sick_nerd/" content-href="https://www.twitch.tv/sick_nerd/clip/Joyous?tt_content=clip&amp;tt_medium=mobile_web_share" comment-count="352" created-timestamp="2026-11-11T19:51:22.404000+0000" domain="twitch.tv" id="t3_1xtrqx2" post-title="Sick_Nerd Disconnects and Dies" post-type="link" score="993" upvote-ratio="0.94" subreddit-prefixed-name="r/2007scape" author="carol" subreddit-name="2007scape" nsfw>
+  <shreddit-post-flair slot="post-flair"><a href="/r/2007scape/?f=flair_name%3A%22HC%20Worlds%22"><span><div aria-label="Flair: :hcworlds: HC Worlds" dir="auto"><img src="https://emoji.redditmedia.com/hcworlds" alt=":hcworlds:"> HC Worlds </div></span></a></shreddit-post-flair>
+  <div slot="post-media-container"><img data-post-media-primary alt="r/2007scape - Sick_Nerd" src="https://external-preview.redd.it/sick-nerd-v0-xlxm.jpeg?width=640&amp;crop=smart&amp;auto=webp&amp;s=42a5" width="640" height="360"></div>
+</shreddit-post></article>
+<article><shreddit-post permalink="/r/2007scape/comments/1xtpeop/3d_printed/" content-href="https://www.reddit.com/gallery/1xtpeop" comment-count="24" created-timestamp="2026-11-11T18:23:38.884000+0000" domain="reddit.com" id="t3_1xtpeop" post-title="3D Printed &amp; Painted Figures" post-type="gallery" score="232" upvote-ratio="0.964" subreddit-prefixed-name="r/2007scape" author="dan" subreddit-name="2007scape">
+  <gallery-carousel>
+    <li><figure><img src="https://preview.redd.it/fig-v0-lixum2uqs01i1.jpeg?width=640&amp;s=1199" width="2252" height="4000" alt=""><img src="https://preview.redd.it/fig-v0-lixum2uqs01i1.jpeg?width=640&amp;s=1199" width="2252" height="4000" alt="r/2007scape - 3D Printed"></figure><img src="https://i.redd.it/lixum2uqs01i1.jpeg" alt="r/2007scape - 3D Printed"></li>
+    <li><figure><img width="800" height="1422" data-lazy-src="https://preview.redd.it/fig-v0-qto3uiliv01i1.gif?width=640&amp;s=2c89" alt=""></figure><img src="https://i.redd.it/qto3uiliv01i1.gif" alt="r/2007scape - 3D Printed"></li>
+  </gallery-carousel>
+</shreddit-post></article>
+<article><shreddit-post permalink="/r/2007scape/comments/1xtc5jk/rhys_dcs/" content-href="https://v.redd.it/bzjptkahxx0i1" comment-count="616" created-timestamp="2026-11-11T08:04:34.765000+0000" domain="v.redd.it" id="t3_1xtc5jk" post-title="Rhys DCs on HC Worlds" post-type="video" score="1394" upvote-ratio="0.94" subreddit-prefixed-name="r/2007scape" author="eve" subreddit-name="2007scape">
+  <div slot="post-media-container"><shreddit-player src="https://v.redd.it/bzjptkahxx0i1/HLSPlaylist.m3u8?f=hd%2CsubsAll&amp;v=1&amp;a=1797" post-type="video" poster="https://external-preview.redd.it/rhys-v0-cG04.png?width=640&amp;s=aa9f" preview="https://v.redd.it/bzjptkahxx0i1/CMAF_96.mp4"><img alt="media poster" src="https://external-preview.redd.it/rhys-v0-cG04.png?width=640&amp;s=aa9f" slot="poster"></shreddit-player></div>
+</shreddit-post></article>
+<article><shreddit-post id="t3_1xtvofg" post-type="image"></shreddit-post></article>
+<faceplate-partial slot="load-after" id="partial-more-posts-dDNfMXh0a3BzMA" loading="programmatic" src="/svc/shreddit/community-more-posts/hot/?after=dDNfMXh0a3BzMA%3D%3D&amp;t=DAY&amp;name=2007scape&amp;feedLength=33" method="GET"></faceplate-partial>
+"#;
+
+	#[test]
+	fn test_parse_feed() {
+		let (posts, more) = parse_feed(FEED);
+		assert!(more);
+		// The ad and the repeated post are left out
+		let names: Vec<_> = posts.iter().map(|p| p["data"]["name"].as_str().unwrap()).collect();
+		assert_eq!(names, ["t3_1xtvofg", "t3_1xtxzng", "t3_1xtrqx2", "t3_1xtpeop", "t3_1xtc5jk"]);
+
+		let image = &posts[0]["data"];
+		assert_eq!(image["id"], "1xtvofg");
+		assert_eq!(image["title"], "For the first time in years, Scythe has dropped below 1b");
+		assert_eq!(image["author"], "alice");
+		assert_eq!(image["subreddit"], "2007scape");
+		assert_eq!(image["permalink"], "/r/2007scape/comments/1xtvofg/for_the_first_time_in_years_scythe_has_dropped/");
+		assert_eq!(image["url"], "https://i.redd.it/69w23zll721i1.jpeg");
+		assert_eq!(image["score"], 504);
+		assert_eq!(image["num_comments"], 93);
+		assert_eq!(image["upvote_ratio"], 0.9701492537313433);
+		assert_eq!(image["created_utc"], 1794436028);
+		assert_eq!(image["link_flair_text"], "Other");
+		assert_eq!(image["over_18"], false);
+		assert_eq!(image["post_hint"], "image");
+		assert_eq!(
+			image["preview"]["images"][0]["source"],
+			json_value!({ "url": "https://preview.redd.it/x-v0-69w23zll721i1.jpeg?width=640&crop=smart&auto=webp&s=ea58", "width": 640, "height": 383 })
 		);
 
-		assert_eq!(parse_feed("<html><body>Please wait for verification</body></html>"), (vec![], String::new()));
+		let text = &posts[1]["data"];
+		assert_eq!(text["is_self"], true);
+		assert_eq!(text["spoiler"], true);
+		assert_eq!(
+			text["selftext_html"],
+			r#"<div class="md"><p> Grab a guy from the lobby. </p><p> purples are 28% better </p></div>"#
+		);
+
+		let link = &posts[2]["data"];
+		assert_eq!(link["over_18"], true);
+		assert_eq!(link["url"], "https://www.twitch.tv/sick_nerd/clip/Joyous?tt_content=clip&tt_medium=mobile_web_share");
+		assert_eq!(link["link_flair_text"], "HC Worlds");
+		assert_eq!(
+			link["thumbnail"],
+			"https://external-preview.redd.it/sick-nerd-v0-xlxm.jpeg?width=640&crop=smart&auto=webp&s=42a5"
+		);
+		assert_eq!(link["thumbnail_width"], 640);
+
+		let gallery = &posts[3]["data"];
+		assert_eq!(gallery["title"], "3D Printed & Painted Figures");
+		assert_eq!(gallery["is_gallery"], true);
+		assert_eq!(
+			gallery["gallery_data"]["items"],
+			json_value!([{ "media_id": "lixum2uqs01i1" }, { "media_id": "qto3uiliv01i1" }])
+		);
+		assert_eq!(gallery["media_metadata"]["lixum2uqs01i1"]["s"]["u"], "https://i.redd.it/lixum2uqs01i1.jpeg");
+		assert_eq!(gallery["media_metadata"]["lixum2uqs01i1"]["s"]["x"], 2252);
+		assert_eq!(gallery["media_metadata"]["qto3uiliv01i1"]["m"], "image/gif");
+		assert_eq!(gallery["media_metadata"]["qto3uiliv01i1"]["s"]["y"], 1422);
+
+		let video = &posts[4]["data"];
+		let hls = "https://v.redd.it/bzjptkahxx0i1/HLSPlaylist.m3u8?f=hd%2CsubsAll&v=1&a=1797";
+		assert_eq!(video["secure_media"]["reddit_video"]["hls_url"], hls);
+		assert_eq!(video["secure_media"]["reddit_video"]["fallback_url"], hls);
+		assert_eq!(
+			video["preview"]["images"][0]["source"]["url"],
+			"https://external-preview.redd.it/rhys-v0-cG04.png?width=640&s=aa9f"
+		);
+
+		// Not a feed
+		assert_eq!(parse_feed("<html><body>Please wait for verification</body></html>"), (vec![], false));
+	}
+
+	#[tokio::test]
+	async fn test_feed_media() {
+		// The posts read as Redlib's JSON parsing expects
+		let (posts, _) = parse_feed(FEED);
+		let mut kinds = Vec::new();
+		for post in &posts {
+			let (kind, media, gallery) = crate::utils::Media::parse(&post["data"]).await;
+			kinds.push((kind, media.url, media.alt_url, gallery.len()));
+		}
+		assert_eq!(
+			kinds,
+			[
+				("image".to_string(), "/img/69w23zll721i1.jpeg".to_string(), String::new(), 0),
+				("self".into(), "/r/2007scape/comments/1xtxzng/psa_duo_tfa/".into(), String::new(), 0),
+				(
+					"link".into(),
+					"https://www.twitch.tv/sick_nerd/clip/Joyous?tt_content=clip&tt_medium=mobile_web_share".into(),
+					String::new(),
+					0
+				),
+				("gallery".into(), "/gallery/1xtpeop".into(), String::new(), 2),
+				(
+					"video".into(),
+					"/hls/bzjptkahxx0i1/HLSPlaylist.m3u8?f=hd%2CsubsAll&v=1&a=1797".into(),
+					"/hls/bzjptkahxx0i1/HLSPlaylist.m3u8?f=hd%2CsubsAll&v=1&a=1797".into(),
+					0
+				),
+			]
+		);
 	}
 
 	#[test]
